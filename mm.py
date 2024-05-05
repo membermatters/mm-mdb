@@ -3,6 +3,7 @@ import config
 import logging
 import time
 import threading
+from queue import Queue
 from websocket import WebSocketApp, WebSocket
 
 # This is meant to be a more generic implementation of the MM websocket protocol that will hopefully one day be used
@@ -24,12 +25,20 @@ def build_packet(command: str, data=None) -> str:
     return command_packet
 
 
+def get_command_object(command: str, data: object = None):
+    return {
+        "command": command,
+        "data": data
+    }
+
+
 class MM:
-    def __init__(self, websocket_secret: str, ip_address: str):
+    def __init__(self, websocket_secret: str, ip_address: str, command_queue: Queue):
         logger.debug("Initializing MM module")
         self.ws: WebSocketApp or None = None
         self.api_secret = websocket_secret
         self.ip_address = ip_address
+        self.command_queue = command_queue
         self.last_pong = 0
         self.device_locked_out = False
         self._thread_for_ping = None
@@ -112,19 +121,20 @@ class MM:
             elif command_object.get("command") == "debit":
                 success = command_object.get("success")
                 balance = command_object.get("balance")
-                balance = (
+
+                success_string = "successful" if success else "unsuccessful"
+                balance_string = (
                     f"${str(round(float(balance) / 100, 2))}"
                     if balance
                     else "Unknown"
                 )
-                logger.debug(f"Debit result received. Success: {success}, Balance: {balance}.")
+                logger.info(f"Debit was {success_string}, balance remaining is {balance_string}.")
 
-                if success:
-                    logger.info(f"Debit successful for {balance}!")
-                    # TODO: send MDB message
-                else:
-                    logger.info("Debit failed!")
-                    # TODO: send MDB message
+                data = {
+                    "success": success,
+                    "balance": balance,
+                }
+                self.command_queue.put(get_command_object("DEBIT_RESULT", data))
             else:
                 logger.warning("Unknown websocket packet!")
                 logger.warning(command_object)
@@ -151,11 +161,12 @@ class MM:
         logger.debug("Sending pong packet")
         self.ws.send(build_packet("pong"))
 
-    def send_debit_request(self, amount: int, card_id: str):
+    def send_debit_request(self, amount: int, card_id: str, item_number: str):
         logger.info(f"Sending debit request for {amount} cents.")
         debit_object = {
             "card_id": card_id,
             "amount": amount/100,  # the API expects dollars, not cents
+            "item_number": item_number
         }
         debit_packet = build_packet("debit", debit_object)
         self.ws.send(debit_packet)
@@ -178,7 +189,6 @@ class PingThread(threading.Thread):
 
     def run(self):
         while not self._stop_event.wait(config.PING_PERIOD):
-            self.logger.debug("Ping thread running...")
             if self.mm.last_pong < time.time() - config.PING_PERIOD * 3:
                 self.logger.warning("Ping thread detected websocket connection failure!")
                 self.mm.ws.close()
