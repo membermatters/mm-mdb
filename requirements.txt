@@ -2,4 +2,4 @@ netifaces
 websocket-client
 rel
 pyserial
-pywiegand
+pigpio

@@ -10,7 +10,7 @@ from websocket import WebSocketApp, WebSocket
 # across both the mm-mdb code and the beepbeep-mainboard firmware code.
 
 logger = logging.getLogger("mm")
-logger.setLevel(config.LOG_LEVEL)
+logger.setLevel(config.MM_LOG_LEVEL)
 
 
 def build_packet(command: str, data=None) -> str:
@@ -53,16 +53,23 @@ class MM:
         self._thread_for_ping = PingThread(self)
         self._thread_for_ping.start()
 
-    def ws_on_close(self, ws: WebSocket) -> None:
-        logger.info("WS Disconnected")
+    def ws_on_close(self, ws: WebSocket, status_code, msg) -> None:
+        logger.info(f"WS Disconnected: {status_code} ({msg})")
         self.ws = None
         if not self._thread_for_ping.stopped():
             self._thread_for_ping.stop()
             self._thread_for_ping.join()
-            logger.debug("Ping thread stopped.")
+            logger.info("Ping thread stopped.")
 
-    def ws_on_error(self, ws: WebSocket, error: Exception) -> None:
+    def ws_on_error(self, ws, error) -> None:
         logger.error(f"WS Error: {error}")
+
+        if not self._thread_for_ping.stopped():
+            self._thread_for_ping.stop()
+            self._thread_for_ping.join()
+            logger.info("Ping thread stopped.")
+
+        raise error
 
     def ws_on_message(self, ws: WebSocket, message: str) -> None:
         try:
@@ -119,12 +126,14 @@ class MM:
                 logger.debug("Received interlock session_update request but not an interlock!")
 
             elif command_object.get("command") == "debit":
+                print("Received debit request!")
+                print(command_object)
                 success = command_object.get("success")
                 balance = command_object.get("balance")
 
                 success_string = "successful" if success else "unsuccessful"
                 balance_string = (
-                    f"${str(round(float(balance) / 100, 2))}"
+                    f"${str(balance/100)}"
                     if balance
                     else "Unknown"
                 )
@@ -161,11 +170,11 @@ class MM:
         logger.debug("Sending pong packet")
         self.ws.send(build_packet("pong"))
 
-    def send_debit_request(self, amount: int, card_id: str, item_number: str):
+    def send_debit_request(self, amount: int, card_id: str, item_number: int):
         logger.info(f"Sending debit request for {amount} cents.")
         debit_object = {
             "card_id": card_id,
-            "amount": amount/100,  # the API expects dollars, not cents
+            "amount": amount / 100,  # the API expects dollars, but we get cents
             "item_number": item_number
         }
         debit_packet = build_packet("debit", debit_object)
@@ -178,7 +187,7 @@ class PingThread(threading.Thread):
         self._stop_event = threading.Event()
         self.mm = mm
 
-        logging.basicConfig(level=config.LOG_LEVEL)
+        logging.basicConfig(level=config.MM_LOG_LEVEL)
         self.logger = logging.getLogger("mm:ping_thread")
 
     def stop(self):
