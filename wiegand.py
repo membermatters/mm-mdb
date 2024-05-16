@@ -1,128 +1,80 @@
-#!/usr/bin/env python
-
 import pigpio
 
-class decoder:
 
-   """
-   A class to read Wiegand codes of an arbitrary length.
+class Decoder:
+    def __init__(self, pi, gpio_0, gpio_1, callback, bit_timeout=5, wiegand_32bit_mode=False, raw_mode=False):
+        """
+        The callback is passed the code length in bits and the card uid/value.
+        """
 
-   The code length and value are returned.
+        self.pi = pi
+        self.gpio_0 = gpio_0
+        self.gpio_1 = gpio_1
+        self.raw_mode = raw_mode
+        self.wiegand_32bit_mode = wiegand_32bit_mode
 
-   EXAMPLE
+        self.callback = callback
+        self.bit_timeout = bit_timeout
+        self.receiving_bits = False
 
-   #!/usr/bin/env python
+        self.pi.set_mode(gpio_0, pigpio.INPUT)
+        self.pi.set_mode(gpio_1, pigpio.INPUT)
+        self.pi.set_pull_up_down(gpio_0, pigpio.PUD_UP)
+        self.pi.set_pull_up_down(gpio_1, pigpio.PUD_UP)
 
-   import time
+        self.cb_0 = self.pi.callback(gpio_0, pigpio.FALLING_EDGE, self._cb)
+        self.cb_1 = self.pi.callback(gpio_1, pigpio.FALLING_EDGE, self._cb)
 
-   import pigpio
+    def _cb(self, gpio, level, tick):
+        """
+        Accumulate bits until both gpios 0 and 1 timeout.
+        """
 
-   import wiegand
+        if level < pigpio.TIMEOUT:
+            if not self.receiving_bits:
+                self.bits = 1
+                self.num = 0
 
-   def callback(bits, code):
-      print("bits={} code={}".format(bits, code))
-
-   pi = pigpio.pi()
-
-   w = wiegand.decoder(pi, 14, 15, callback)
-
-   time.sleep(300)
-
-   w.cancel()
-
-   pi.stop()
-   """
-
-   def __init__(self, pi, gpio_0, gpio_1, callback, bit_timeout=5):
-
-      """
-      Instantiate with the pi, gpio for 0 (green wire), the gpio for 1
-      (white wire), the callback function, and the bit timeout in
-      milliseconds which indicates the end of a code.
-
-      The callback is passed the code length in bits and the value.
-      """
-
-      self.pi = pi
-      self.gpio_0 = gpio_0
-      self.gpio_1 = gpio_1
-
-      self.callback = callback
-
-      self.bit_timeout = bit_timeout
-
-      self.in_code = False
-
-      self.pi.set_mode(gpio_0, pigpio.INPUT)
-      self.pi.set_mode(gpio_1, pigpio.INPUT)
-
-      self.pi.set_pull_up_down(gpio_0, pigpio.PUD_UP)
-      self.pi.set_pull_up_down(gpio_1, pigpio.PUD_UP)
-
-      self.cb_0 = self.pi.callback(gpio_0, pigpio.FALLING_EDGE, self._cb)
-      self.cb_1 = self.pi.callback(gpio_1, pigpio.FALLING_EDGE, self._cb)
-
-   def _cb(self, gpio, level, tick):
-
-      """
-      Accumulate bits until both gpios 0 and 1 timeout.
-      """
-
-      if level < pigpio.TIMEOUT:
-
-         if self.in_code == False:
-            self.bits = 1
-            self.num = 0
-
-            self.in_code = True
-            self.code_timeout = 0
-            self.pi.set_watchdog(self.gpio_0, self.bit_timeout)
-            self.pi.set_watchdog(self.gpio_1, self.bit_timeout)
-         else:
-            self.bits += 1
-            self.num = self.num << 1
-
-         if gpio == self.gpio_0:
-            self.code_timeout = self.code_timeout & 2 # clear gpio 0 timeout
-         else:
-            self.code_timeout = self.code_timeout & 1 # clear gpio 1 timeout
-            self.num = self.num | 1
-
-      else:
-
-         if self.in_code:
+                self.receiving_bits = True
+                self.receiving_bits_timeout = 0
+                self.pi.set_watchdog(self.gpio_0, self.bit_timeout)
+                self.pi.set_watchdog(self.gpio_1, self.bit_timeout)
+            else:
+                self.bits += 1
+                self.num = self.num << 1
 
             if gpio == self.gpio_0:
-               self.code_timeout = self.code_timeout | 1 # timeout gpio 0
+                self.receiving_bits_timeout = self.receiving_bits_timeout & 2  # clear gpio 0 timeout
             else:
-               self.code_timeout = self.code_timeout | 2 # timeout gpio 1
+                self.receiving_bits_timeout = self.receiving_bits_timeout & 1  # clear gpio 1 timeout
+                self.num = self.num | 1
 
-            if self.code_timeout == 3: # both gpios timed out
-               self.pi.set_watchdog(self.gpio_0, 0)
-               self.pi.set_watchdog(self.gpio_1, 0)
-               self.in_code = False
-               self.callback(self.bits, self.num)
+        else:
+            if self.receiving_bits:
+                if gpio == self.gpio_0:
+                    self.receiving_bits_timeout = self.receiving_bits_timeout | 1  # timeout gpio 0
+                else:
+                    self.receiving_bits_timeout = self.receiving_bits_timeout | 2  # timeout gpio 1
 
-   def cancel(self):
+                if self.receiving_bits_timeout == 3:  # both gpios timed out
+                    self.pi.set_watchdog(self.gpio_0, 0)
+                    self.pi.set_watchdog(self.gpio_1, 0)
+                    self.receiving_bits = False
 
-      """
-      Cancel the Wiegand decoder.
-      """
+                    if self.raw_mode:
+                        self.callback(self.bits, self.num)
+                    else:
+                        # get only the bits we're interested in
+                        card_mask_26bit = 0b0_00000000_11111111_11111111_11111111_0
+                        card_mask_34bit = 0b0_11111111_11111111_11111111_11111111_0
+                        card_mask = card_mask_34bit if self.wiegand_32bit_mode else card_mask_26bit
+                        card_uid = self.num & card_mask >> 1  # strip off the remaining parity bit
+                        self.callback(self.bits, card_uid)
 
-      self.cb_0.cancel()
-      self.cb_1.cancel()
+    def cancel(self):
+        """
+        Cancel the Wiegand decoder.
+        """
 
-if __name__ == "__main__":
-
-   def callback(bits, value):
-      print("bits={} value={}".format(bits, value))
-
-   pi = pigpio.pi()
-
-   w = wiegand.decoder(pi, 14, 15, callback)
-
-   time.sleep(300)
-
-   w.cancel()
-
-   pi.stop()
+        self.cb_0.cancel()
+        self.cb_1.cancel()

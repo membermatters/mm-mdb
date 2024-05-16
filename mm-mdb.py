@@ -160,7 +160,7 @@ if __name__ == "__main__":
 
 
     pi = pigpio.pi()
-    wiegand_reader = wiegand.decoder(pi, 6, 5, callback)
+    wiegand_reader = wiegand.Decoder(pi, 6, 5, callback)
     websocket_client = websocket.WebSocketApp(PORTAL_WS_URL,
                                               on_open=mm.ws_on_open,
                                               on_message=mm.ws_on_message,
