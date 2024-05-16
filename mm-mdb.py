@@ -10,6 +10,7 @@ from queue import Queue
 import pymultidropbus
 import pigpio
 import wiegand
+import os
 
 logger = logging.getLogger("mm-mdb")
 logger.setLevel(config.MDB_LOG_LEVEL)
@@ -142,6 +143,11 @@ class CommandQueueThread(threading.Thread):
 
 
 if __name__ == "__main__":
+    if config.PROCESS_AFFINITY:
+        affinity_mask = {config.PROCESS_AFFINITY}  # The third core is used by default
+        pid = 0  # 0 is the current process
+        os.sched_setaffinity(pid, affinity_mask)
+
     commands_queue = Queue()
     mdb = pymultidropbus.MDB(commands_queue, log_level=config.MDB_LOG_LEVEL)
     mm = mm.MM(config.API_SECRET, ip_address, commands_queue)
