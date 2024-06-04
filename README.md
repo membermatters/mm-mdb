@@ -11,6 +11,7 @@ sudo apt install ./wiringpi_3.2-bullseye_armhf.deb
 
 Install required python packages by running the following command:
 ```
+sudo apt install python3-dev
 pip3 install -r requirements.txt
 ```
 

@@ -3,3 +3,4 @@ websocket-client
 rel
 pyserial
 pigpio
+pywiegandpi >= 1.0.1

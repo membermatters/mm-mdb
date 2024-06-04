@@ -5,10 +5,12 @@ import time
 import threading
 from queue import Queue
 from websocket import WebSocketApp, WebSocket
+import pymultidropbus.protocol
 
 # This is meant to be a more generic implementation of the MM websocket protocol that will hopefully one day be used
 # across both the mm-mdb code and the beepbeep-mainboard firmware code.
 
+logging.basicConfig()
 logger = logging.getLogger("mm")
 logger.setLevel(config.MM_LOG_LEVEL)
 
@@ -21,7 +23,7 @@ def build_packet(command: str, data=None) -> str:
         **data
     }
     command_packet = json.dumps(command_object)
-    # logger.debug(f"Built command:\n{command_packet}")
+    logger.debug(f"Built command:\n{command_packet}")
     return command_packet
 
 
@@ -33,18 +35,25 @@ def get_command_object(command: str, data: object = None):
 
 
 class MM:
-    def __init__(self, websocket_secret: str, ip_address: str, command_queue: Queue):
+    def __init__(self, websocket_secret: str, ip_address: str, ws_command_queue: Queue, mdb_command_queue: Queue):
         logger.debug("Initializing MM module")
         self.ws: WebSocketApp or None = None
         self.api_secret = websocket_secret
         self.ip_address = ip_address
-        self.command_queue = command_queue
+        self.ws_command_queue = ws_command_queue
+        self.mdb_command_queue = mdb_command_queue
         self.last_pong = 0
         self.device_locked_out = False
         self._thread_for_ping = None
 
+    def _ws_send(self, message: str):
+        if self.ws:
+            self.ws.send(str)
+        else:
+            logger.warning(f"Tried to send message but no websocket connection! {message}")
+
     def ws_on_open(self, ws: WebSocket) -> None:
-        logger.info("WS Connected")
+        logger.info("MM WS Connected")
         self.ws = ws
         self.last_pong = time.time()
         self.send_authentication()
@@ -54,22 +63,15 @@ class MM:
         self._thread_for_ping.start()
 
     def ws_on_close(self, ws: WebSocket, status_code, msg) -> None:
-        logger.info(f"WS Disconnected: {status_code} ({msg})")
+        logger.info(f"MM WS Disconnected: {status_code} ({msg})")
         self.ws = None
-        if not self._thread_for_ping.stopped():
+        if self._thread_for_ping and not self._thread_for_ping.stopped():
             self._thread_for_ping.stop()
             self._thread_for_ping.join()
-            logger.info("Ping thread stopped.")
+            logger.warning("Ping thread stopped.")
 
     def ws_on_error(self, ws, error) -> None:
         logger.error(f"WS Error: {error}")
-
-        if not self._thread_for_ping.stopped():
-            self._thread_for_ping.stop()
-            self._thread_for_ping.join()
-            logger.info("Ping thread stopped.")
-
-        raise error
 
     def ws_on_message(self, ws: WebSocket, message: str) -> None:
         try:
@@ -125,9 +127,27 @@ class MM:
                 # we can safely ignore this command if we're not an interlock
                 logger.debug("Received interlock session_update request but not an interlock!")
 
+            elif command_object.get("command") == "balance":
+                logger.debug("Received balance: " + json.dumps(command_object))
+                success = command_object.get("success", True)
+                balance = command_object.get("balance")
+
+                success_string = "successful" if success else "unsuccessful"
+                balance_string = (
+                    f"${str(balance/100)}"
+                    if balance
+                    else "Unknown"
+                )
+                logger.info(f"Balance request was {success_string}, balance is {balance_string}.")
+
+                data = {
+                    "success": success,
+                    "balance": balance,
+                }
+                self.ws_command_queue.put(get_command_object("BALANCE_RESULT", data))
+
             elif command_object.get("command") == "debit":
-                print("Received debit request!")
-                print(command_object)
+                logger.debug("Received debit request: " + json.dumps(command_object))
                 success = command_object.get("success")
                 balance = command_object.get("balance")
 
@@ -143,7 +163,7 @@ class MM:
                     "success": success,
                     "balance": balance,
                 }
-                self.command_queue.put(get_command_object("DEBIT_RESULT", data))
+                self.ws_command_queue.put(get_command_object("DEBIT_RESULT", data))
             else:
                 logger.warning("Unknown websocket packet!")
                 logger.warning(command_object)
@@ -153,12 +173,12 @@ class MM:
             logger.error(str(e))
 
     def send_authentication(self):
-        logger.info("Sending authentication packet")
+        logger.debug("Sending authentication packet")
         auth_packet = build_packet("authenticate", {"secret_key": self.api_secret})
         self.ws.send(auth_packet)
 
     def send_ip(self):
-        logger.info("Sending IP packet")
+        logger.debug("Sending IP packet")
         ip_packet = build_packet("ip_address", {"ip_address": self.ip_address})
         self.ws.send(ip_packet)
 
@@ -170,14 +190,23 @@ class MM:
         logger.debug("Sending pong packet")
         self.ws.send(build_packet("pong"))
 
-    def send_debit_request(self, amount: int, card_id: str, item_number: int):
+    def send_debit_request(self, amount: pymultidropbus.protocol.Money, card_id: str, item_number: int = None):
         logger.info(f"Sending debit request for {amount} cents.")
         debit_object = {
             "card_id": card_id,
-            "amount": amount / 100,  # the API expects dollars, but we get cents
-            "item_number": item_number
+            "amount": amount.dollars,  # api expects dollars
         }
+        if item_number:
+            debit_object["product_external_id"] = item_number
         debit_packet = build_packet("debit", debit_object)
+        self.ws.send(debit_packet)
+
+    def send_balance_request(self, card_id: str):
+        logger.info(f"Sending balance request for card_id: {card_id}.")
+        command_object = {
+            "card_id": card_id,
+        }
+        debit_packet = build_packet("balance", command_object)
         self.ws.send(debit_packet)
 
 
