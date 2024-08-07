@@ -4,7 +4,7 @@ import logging
 import time
 import threading
 from queue import Queue
-from websocket import WebSocketApp, WebSocket
+from websocket import WebSocketApp, WebSocket, WebSocketConnectionClosedException
 import pymultidropbus.protocol
 
 # This is meant to be a more generic implementation of the MM websocket protocol that will hopefully one day be used
@@ -37,41 +37,19 @@ def get_command_object(command: str, data: object = None):
 class MM:
     def __init__(self, websocket_secret: str, ip_address: str, ws_command_queue: Queue, mdb_command_queue: Queue):
         logger.debug("Initializing MM module")
-        self.ws: WebSocketApp or None = None
+        self.ws: WebSocket = None
         self.api_secret = websocket_secret
         self.ip_address = ip_address
         self.ws_command_queue = ws_command_queue
         self.mdb_command_queue = mdb_command_queue
         self.last_pong = 0
         self.device_locked_out = False
-        self._thread_for_ping = None
 
     def _ws_send(self, message: str):
         if self.ws:
-            self.ws.send(str)
+            self.ws.send(message)
         else:
             logger.warning(f"Tried to send message but no websocket connection! {message}")
-
-    def ws_on_open(self, ws: WebSocket) -> None:
-        logger.info("MM WS Connected")
-        self.ws = ws
-        self.last_pong = time.time()
-        self.send_authentication()
-
-        # create a new ping thread and start it
-        self._thread_for_ping = PingThread(self)
-        self._thread_for_ping.start()
-
-    def ws_on_close(self, ws: WebSocket, status_code, msg) -> None:
-        logger.info(f"MM WS Disconnected: {status_code} ({msg})")
-        self.ws = None
-        if self._thread_for_ping and not self._thread_for_ping.stopped():
-            self._thread_for_ping.stop()
-            self._thread_for_ping.join()
-            logger.warning("Ping thread stopped.")
-
-    def ws_on_error(self, ws, error) -> None:
-        logger.error(f"WS Error: {error}")
 
     def ws_on_message(self, ws: WebSocket, message: str) -> None:
         try:
@@ -175,20 +153,20 @@ class MM:
     def send_authentication(self):
         logger.debug("Sending authentication packet")
         auth_packet = build_packet("authenticate", {"secret_key": self.api_secret})
-        self.ws.send(auth_packet)
+        self._ws_send(auth_packet)
 
     def send_ip(self):
         logger.debug("Sending IP packet")
         ip_packet = build_packet("ip_address", {"ip_address": self.ip_address})
-        self.ws.send(ip_packet)
+        self._ws_send(ip_packet)
 
     def send_ping(self):
         logger.debug("Sending ping packet")
-        self.ws.send(build_packet("ping"))
+        self._ws_send(build_packet("ping"))
 
     def send_pong(self):
         logger.debug("Sending pong packet")
-        self.ws.send(build_packet("pong"))
+        self._ws_send(build_packet("pong"))
 
     def send_debit_request(self, amount: pymultidropbus.protocol.Money, card_id: str, item_number: int = None):
         logger.info(f"Sending debit request for {amount} cents.")
@@ -199,7 +177,7 @@ class MM:
         if item_number:
             debit_object["product_external_id"] = item_number
         debit_packet = build_packet("debit", debit_object)
-        self.ws.send(debit_packet)
+        self._ws_send(debit_packet)
 
     def send_balance_request(self, card_id: str):
         logger.info(f"Sending balance request for card_id: {card_id}.")
@@ -207,29 +185,4 @@ class MM:
             "card_id": card_id,
         }
         debit_packet = build_packet("balance", command_object)
-        self.ws.send(debit_packet)
-
-
-class PingThread(threading.Thread):
-    def __init__(self, mm: MM):
-        super().__init__()
-        self._stop_event = threading.Event()
-        self.mm = mm
-
-        logging.basicConfig(level=config.MM_LOG_LEVEL)
-        self.logger = logging.getLogger("mm:ping_thread")
-
-    def stop(self):
-        self._stop_event.set()
-
-    def stopped(self):
-        return self._stop_event.is_set()
-
-    def run(self):
-        while not self._stop_event.wait(config.PING_PERIOD):
-            if self.mm.last_pong < time.time() - config.PING_PERIOD * 3:
-                self.logger.warning("Ping thread detected websocket connection failure!")
-                self.mm.ws.close()
-                self.stop()
-            else:
-                self.mm.send_ping()
+        self._ws_send(debit_packet)

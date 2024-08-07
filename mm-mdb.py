@@ -1,11 +1,10 @@
-import mm
+import mm as mm_library
 import config
 
 import threading
 import netifaces
-import rel
 import websocket
-from websocket import WebSocket, WebSocketException
+from websocket import WebSocket, WebSocketConnectionClosedException
 import logging
 import time
 from queue import Queue
@@ -32,7 +31,7 @@ CURRENT_SESSION_CARD_ID: str = ""
 
 
 class WsCommandQueueThread(threading.Thread):
-    def __init__(self, queue: Queue, mm_client: mm.MM, mdb_client: pymultidropbus.CashlessPeripheral):
+    def __init__(self, queue: Queue, mm_client: mm_library.MM, mdb_client: pymultidropbus.CashlessPeripheral):
         super().__init__()
         self._stop_event = threading.Event()
         self.queue = queue
@@ -75,7 +74,7 @@ class WsCommandQueueThread(threading.Thread):
 
 
 class CommandQueueThread(threading.Thread):
-    def __init__(self, queue: Queue, mm_client: mm.MM, mdb_client: pymultidropbus.CashlessPeripheral):
+    def __init__(self, queue: Queue, mm_client: mm_library.MM, mdb_client: pymultidropbus.CashlessPeripheral):
         super().__init__()
         self._stop_event = threading.Event()
         self.queue = queue
@@ -174,63 +173,118 @@ class CommandQueueThread(threading.Thread):
                 logger.debug("Reader cancelled!")
 
 
+class PingThread(threading.Thread):
+    def __init__(self, mm_object: mm_library.MM):
+        super().__init__()
+        self._stop_event = threading.Event()
+        self.mm = mm_object
+
+        logging.basicConfig(level=config.MM_LOG_LEVEL)
+        self.logger = logging.getLogger("mm:ping_thread")
+
+    def stop(self):
+        self._stop_event.set()
+
+    def stopped(self):
+        return self._stop_event.is_set()
+
+    def run(self):
+        while not self._stop_event.wait(config.PING_PERIOD):
+            if self.mm.last_pong < time.time() - config.PING_PERIOD * 3:
+                self.logger.warning("Ping thread detected websocket connection failure!")
+                self.mm.ws.close()
+
+            else:
+                self.mm.send_ping()
+
+
 if __name__ == "__main__":
-    mdb_commands_queue = Queue()
-    ws_commands_queue = Queue()
-    mdb = pymultidropbus.CashlessPeripheral(mdb_commands_queue, log_level=config.MDB_LOG_LEVEL, process_affinity=config.PROCESS_AFFINITY)
-    mm = mm.MM(config.API_SECRET, ip_address, ws_commands_queue, mdb_commands_queue)
-    queue_thread = CommandQueueThread(mdb_commands_queue, mm, mdb)
-    ws_queue_thread = WsCommandQueueThread(ws_commands_queue, mm, mdb)
+    while True:
+        queue_thread: CommandQueueThread or None = None
+        ws_queue_thread: WsCommandQueueThread or None = None
+        thread_for_ping: PingThread or None = None
 
-    def wiegand_callback(bits: int, value: int):
-        global CURRENT_SESSION_CARD_ID
-        if config.MIN_CARD_SCAN_VALUE and value > config.MIN_CARD_SCAN_VALUE:
-            CURRENT_SESSION_CARD_ID = str(value)
-            logger.info("Card scanned: " + CURRENT_SESSION_CARD_ID)
-            mm.send_balance_request(CURRENT_SESSION_CARD_ID)
+        try:
+            mdb_commands_queue = Queue()
+            ws_commands_queue = Queue()
+            mdb = pymultidropbus.CashlessPeripheral(mdb_commands_queue, log_level=config.MDB_LOG_LEVEL, process_affinity=config.PROCESS_AFFINITY)
+            mm = mm_library.MM(config.API_SECRET, ip_address, ws_commands_queue, mdb_commands_queue)
+            queue_thread = CommandQueueThread(mdb_commands_queue, mm, mdb)
+            ws_queue_thread = WsCommandQueueThread(ws_commands_queue, mm, mdb)
+            thread_for_ping = PingThread(mm)
 
-        else:
-            logger.info("Ignoring card scan with value: " + str(value))
-            return
+            def wiegand_callback(bits: int, value: int):
+                global CURRENT_SESSION_CARD_ID
+                try:
+                    if config.MIN_CARD_SCAN_VALUE and value > config.MIN_CARD_SCAN_VALUE:
+                        CURRENT_SESSION_CARD_ID = str(value)
+                        logger.info("Card scanned: " + CURRENT_SESSION_CARD_ID)
+                        mm.send_balance_request(CURRENT_SESSION_CARD_ID)
 
+                    else:
+                        logger.info("Ignoring card scan with value: " + str(value))
+                        return
+                except WebSocketConnectionClosedException:
+                    logger.warning("Websocket connection closed, will automatically reconnect soon.")
+                    mm.ws.close()
 
-    wiegand_reader = pywiegandpi.WiegandDecoder(5, 6, wiegand_callback)
-
-    def ws_on_open(ws: WebSocket) -> None:
-        global CURRENT_SESSION_CARD_ID
-        logger.info("MemberMatters Connected")
-        CURRENT_SESSION_CARD_ID = ""
-        mm.ws_on_open(ws)
-
-    def ws_on_close(ws: WebSocket, status_code, msg) -> None:
-        global CURRENT_SESSION_CARD_ID
-        logger.warning(f"WS Disconnected: {status_code} ({msg or 'no message'})")
-        mm.ws_on_close(ws, status_code, msg)
-        CURRENT_SESSION_CARD_ID = ""
-        time.sleep(5)
-        websocket_client.run_forever(dispatcher=rel, reconnect=5)
-
-    def ws_on_error(ws, error) -> None:
-        logger.error(f"WS Error: {error}")
-        mm.ws_on_error(ws, error)
+            wiegand_reader = pywiegandpi.WiegandDecoder(5, 6, wiegand_callback)
 
 
-    def ws_on_message(ws: WebSocket, message: str):
-        logger.debug("Got message: " + message)
-        mm.ws_on_message(ws, message)
+            def ws_on_open(ws: WebSocket) -> None:
+                global thread_for_ping
+                logger.info("MM WS Connected")
+                mm.ws = ws
+                mm.send_authentication()
+                mm.last_pong = time.time()
+
+                # create a new ping thread and start it
+                thread_for_ping = PingThread(mm)
+                thread_for_ping.start()
 
 
-    websocket_client = websocket.WebSocketApp(PORTAL_WS_URL,
-                                              on_open=ws_on_open,
-                                              on_message=ws_on_message,
-                                              on_error=ws_on_error,
-                                              on_close=ws_on_close)
+            def ws_on_close(ws: WebSocket, status_code, msg) -> None:
+                global CURRENT_SESSION_CARD_ID
+                logger.warning(f"WS Disconnected: {status_code} ({msg or 'no message'})")
+                mdb.serial_port.close()
+                CURRENT_SESSION_CARD_ID = ""
+                time.sleep(5)
+                raise RuntimeError("Websocket connection closed, reconnecting...")
 
-    queue_thread.start()
-    ws_queue_thread.start()
+            def ws_on_error(ws, error) -> None:
+                logger.error(f"WS Error: {error}")
 
-    # Set dispatcher to automatic reconnection, 5 second reconnect delay if connection closed unexpectedly
-    websocket_client.run_forever(dispatcher=rel, reconnect=5)
-    rel.signal(2, rel.abort)  # Keyboard Interrupt
-    rel.dispatch()
-    logger.warning("Exiting main thread")
+
+            def ws_on_message(ws: WebSocket, message: str):
+                logger.debug("Got message: " + message)
+                mm.ws_on_message(ws, message)
+
+
+            websocket_client = websocket.WebSocketApp(PORTAL_WS_URL,
+                                                      on_open=ws_on_open,
+                                                      on_message=ws_on_message,
+                                                      on_error=ws_on_error,
+                                                      on_close=ws_on_close)
+
+            queue_thread.start()
+            ws_queue_thread.start()
+
+            websocket_client.run_forever()
+            logger.warning("Exiting main thread")
+            queue_thread.stop()
+            ws_queue_thread.stop()
+            thread_for_ping.stop()
+
+        except Exception as e:
+            logger.error(f"Unhandled exception in the main thread: {e}")
+            logger.error(str(e))
+            try:
+                if queue_thread:
+                    queue_thread.stop()
+                if ws_queue_thread:
+                    ws_queue_thread.stop()
+                if thread_for_ping:
+                    thread_for_ping.stop()
+            except Exception as e:
+                logger.error(f"Exception stopping threads: {e}")
+            continue
